@@ -1,0 +1,6 @@
+# Ignore Vim-specific files
+*.swp
+*.swo
+*.swn
+*.un~
+*.ln~
