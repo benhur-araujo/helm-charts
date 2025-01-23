@@ -1,0 +1,323 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, closed, reopened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changed_charts: ${{ steps.changes.outputs.changed_charts }}
+
+    steps:
+      - name: Checkout PR source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      # Requirement for pre-commit
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+          cache: pip
+          cache-dependency-path: ci/requirements.txt
+
+      # Install pre-commit
+      - name: setup ci python dependencies
+        run: |
+          pip install -r ci/requirements.txt
+      
+      - name: Run pre-commit
+        run: |
+          pre-commit run --show-diff-on-failure --color=always --all-files
+      
+      # Check for changes in helm charts
+      - name: Check changes
+        id: changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          head_ref="$(echo $GITHUB_HEAD_REF | tr '/' '-')"
+          
+          # If the PR is open, compare the changes against the main branch
+          if [[ "${{ github.event.action }}" != 'closed' ]]; then
+            git fetch origin main
+            base_sha=$(git rev-parse origin/main)
+            
+            # Example of value for $changed_charts variable: platform/mc-global-service
+            changed_charts=$(dirname $(git diff --name-only $base_sha...HEAD) | sort -u | grep -E '(^dsp/|^platform/)' | tr '\n' ' ' | xargs)
+            
+            if [[ $changed_charts != '' ]]; then
+              if ! git ls-remote --tags origin "refs/tags/base-sha-$head_ref" | grep -q "base-sha-$head_ref"; then
+                git tag base-sha-$head_ref $base_sha
+                git push origin base-sha-$head_ref
+                
+                echo "created temp tag: base-sha-$head_ref"
+              else
+                echo "Temp tag already exist: base-sha-$head_ref"
+              fi
+            fi
+            
+            echo "changed_charts=$changed_charts" >> "$GITHUB_OUTPUT"
+
+          # After closing the PR, compare the changes against the created Tag (see the conditional above)
+          else
+            git fetch --tags
+            base_sha=$(git rev-parse refs/tags/base-sha-$head_ref)
+            
+            # Example of value for $changed_charts variable: platform/mc-global-service
+            changed_charts=$(dirname $(git diff --name-only $base_sha...HEAD) | sort -u | grep -E '(^dsp/|^platform/)' | tr '\n' ' ' | xargs)
+            echo "changed_charts=$changed_charts" >> "$GITHUB_OUTPUT"
+            
+            # Cleaning up the tag
+            git tag -d base-sha-$head_ref
+            git push origin --delete tag base-sha-$head_ref
+
+            echo "Deleted temp tag: base-sha-$head_ref"
+          fi
+  
+  release:
+    runs-on: ubuntu-latest
+    needs: [validate-changes]
+    if: ${{ needs.validate-changes.outputs.changed_charts != '' }}
+    env:
+      changed_charts: ${{ needs.validate-changes.outputs.changed_charts }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      # Determine the commit type for each changed chart
+      - name: Get commit type
+        run: |
+          declare -A commit_types # Associate Array - an Array of key-value pairs
+          for chart in $changed_charts; do
+              # Get the commit message for the latest commit affecting the chart
+              commit_message=$(git log -1 --pretty=%B -- "$chart")
+              
+              # Replace '/' and '-' with '_' in the chart name for environment variable compatibility
+              chart="$(echo $chart | tr '/\-' '_')"
+
+              # Determine the commit type based on the commit message
+              if [[ "$commit_message" == *"!:"* || "$commit_message" == "BREAKING CHANGE:"* ]]; then
+                  commit_types[$chart]="major"
+              elif [[ "$commit_message" == *"feat"* ]]; then
+                  commit_types[$chart]="minor"
+              else
+                  commit_types[$chart]="patch"
+              fi
+          done
+
+          # Loop through the associative array to export commit types as environment variables
+          for chart in "${!commit_types[@]}"; do
+              # Construct the environment variable name by appending "_commit_type" to the chart name
+              # and assign the corresponding commit type value from the associative array
+              echo "${chart}_commit_type=${commit_types[$chart]}" >> "$GITHUB_ENV"
+          done
+
+          # Example:
+          # If the chart name is "platform_mc_global_service" and the commit type is "minor",
+          # the resulting environment variable will be:
+          # platform_mc_global_service_commit_type=minor
+
+      - name: Determine new tag
+        id: determine_tag
+        run: |
+          for chart in $changed_charts; do
+            # Replace '/' and '-' with '_' in the chart name for environment variable compatibility
+            chart="$(echo $chart | tr '/\-' '_')"
+            
+            # Get the latest tag for the chart, sorted in descending order
+            current_tag="$(git tag --sort=-v:refname | grep "$chart" | head -n 1 | sed "s|$chart-||")"
+            
+            # Check if a tag was found
+            if [[ "$current_tag" == "" ]]; then
+              release="$chart-1.0.0"
+            else
+              # Split the current tag into major, minor, and patch components
+              IFS='.' read -r major minor patch <<< "$current_tag"
+              
+              # Get the commit type for the chart from the environment variables
+              commit_type="$(eval echo \$${chart}_commit_type)"
+              
+              # Increment the version number based on the commit type
+              if [[ "$commit_type" == "major" ]]; then
+                major=$((major + 1))
+                minor=0
+                patch=0
+              elif [[ "$commit_type" == "minor" ]]; then
+                minor=$((minor + 1))
+                patch=0
+              elif [[ "$commit_type" == "patch" ]]; then
+                patch=$((patch + 1))
+              fi
+              
+              # Construct the new tag
+              release="$chart-$major.$minor.$patch"
+            fi
+            
+            # Validate & Output the new tag
+            if [[ "$release" =~ ^dsp|platform_[a-zA-Z0-9_]+-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "${chart}_new_tag=$release" >> "$GITHUB_ENV"
+              echo "Release and Tag to be created: $release" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Release and Tag mal-formatted: $release" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          done
+
+      - name: Comment in PR the new tag
+        uses: actions/github-script@v7
+        if: ${{ always() && github.event_name == 'pull_request' && github.event.action != 'closed' }}
+        env:
+          changed_charts: ${{ needs.validate-changes.outputs.changed_charts }}
+          DETERMINE_TAG_OUTCOME: ${{ steps.determine_tag.outcome }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const actionSummaryUrl = (
+              context.serverUrl
+              + '/' + context.repo.owner
+              + '/' + context.repo.repo
+              + '/actions/runs/' + context.runId.toString()
+            );
+
+            const title = '## CI Summary';
+
+            let body = title + "\n\n";
+
+            if (process.env.DETERMINE_TAG_OUTCOME === 'success') {
+              body += '✅ success: ';
+            } else {
+              body += '❌ failure: ';
+            }
+            
+            const changedCharts = process.env.changed_charts.split(' ');
+            for (const chart of changedCharts) {
+              const chartEnv = chart.replace(/[\/\-]/g, '_');
+              const newTag = process.env[`${chartEnv}_new_tag`];
+              body += 'Tagging PLAN \n';
+              body += `- New tag: ${newTag}\n`;
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.startsWith(title);
+            });
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body,
+              });
+            }
+      
+      # When PR Merged: Checkout again to push the tags to the Main Branch
+      - name: Checkout main branch
+        if: ${{ github.event.pull_request.merged == true && github.base_ref == 'main' }}
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # When PR Merged
+      - name: Create tag & release
+        id: tag
+        if: ${{ github.event.pull_request.merged == true && github.base_ref == 'main' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          changed_charts: ${{ needs.validate-changes.outputs.changed_charts }}
+        run: |
+          for chart in $changed_charts; do
+            chart="$(echo $chart | tr '/\-' '_')"
+            new_tag="$(eval echo \$${chart}_new_tag)"
+            git tag "$new_tag"
+            git push origin "$new_tag"
+            gh release create "$new_tag" --title "$new_tag" --notes "$new_tag"
+          done
+
+      - name: Comment in PR after merge
+        uses: actions/github-script@v7
+        if: ${{ always() && github.event.pull_request.merged == true && github.base_ref == 'main' }}
+        env:
+          TAG_OUTCOME: ${{ steps.tag.outcome }}
+          changed_charts: ${{ needs.validate-changes.outputs.changed_charts }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const actionSummaryUrl = (
+              context.serverUrl
+              + '/' + context.repo.owner
+              + '/' + context.repo.repo
+              + '/actions/runs/' + context.runId.toString()
+            );
+
+            const title = '## CI Summary';
+
+            let body = title + "\n\n";
+
+            if (process.env.TAG_OUTCOME === 'success') {
+              body += '✅ success: ';
+            } else {
+              body += '❌ failure: ';
+            }
+
+            body += 'tagging apply 🚀\n\n';
+
+            const changedCharts = process.env.changed_charts.split(' ');
+            for (const chart of changedCharts) {
+              const chartEnv = chart.replace(/[\/\-]/g, '_');
+              const newTag = process.env[`${chartEnv}_new_tag`];
+              body += `- Created tag: ${newTag}\n`;
+            }
+
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.startsWith(title);
+            });
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body,
+              });
+            }
+  
