@@ -52,7 +52,7 @@ jobs:
             base_sha=$(git rev-parse origin/main)
             
             # Example of value for $changed_charts variable: platform/mc-global-service
-            changed_charts=$(dirname $(git diff --name-only $base_sha...HEAD) | sort -u | grep -E '(^dsp/|^platform/)' | tr '\n' ' ' | xargs)
+            changed_charts=$(dirname $(git diff --name-only $base_sha...HEAD) | grep -E '(^dsp/|^platform/)' | cut -d"/" -f1,2 | sort -u | tr '\n' ' ' | xargs)
             
             if [[ $changed_charts != '' ]]; then
               if ! git ls-remote --tags origin "refs/tags/base-sha-$head_ref" | grep -q "base-sha-$head_ref"; then
